@@ -2,14 +2,25 @@
   "version": 2,
   "builds": [
     {
-      "src": "src/app.js",
-      "use": "@vercel/node"
+      "src": "index.js",
+      "use": "@vercel/node",
+      "config": {
+        "maxLambdaSize": "20mb",
+        "includeFiles": [
+          "src/app.js",
+          "src/storage.js",
+          "data/state.json",
+          "data/user_tokens.json",
+          "package.json"
+        ]
+      }
     }
   ],
   "routes": [
     {
-      "src": "/.*",
-      "dest": "src/app.js"
+      "src": "/(.*)",
+      "dest": "index.js"
     }
   ]
 }
+
