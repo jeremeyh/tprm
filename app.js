@@ -16,7 +16,7 @@ const CLIENT_ID = process.env.SLACK_CLIENT_ID; // for OAuth V2
 const CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET;
 const STATE_SECRET = process.env.SLACK_STATE_SECRET; // optional state to mitigate CSRF
 
-// Vercel / Production Host detection for OAuth links
+// Vercel-friendly host detection for OAuth redirects
 const OAUTH_HOST = process.env.VERCEL_URL || process.env.OAUTH_REDIRECT_HOST || 'localhost';
 const OAUTH_PORT = Number(process.env.OAUTH_PORT || 3000);
 const OAUTH_REDIRECT_PATH = process.env.OAUTH_REDIRECT_PATH || '/slack/oauth_redirect';
@@ -37,8 +37,7 @@ const ROUTE_CHANNEL_NAME = process.env.ROUTE_CHANNEL_NAME || '#team-channel';
 const STATUS_EMOJI = process.env.STATUS_EMOJI || ':no_bell:';
 const STATUS_TEXT = process.env.STATUS_TEXT || `Heads-down - please post in ${ROUTE_CHANNEL_NAME}`;
 
-// Persistence files (CRITICAL FIX: Changed paths to point to root directory)
-// This matches the file structure expected by the Vercel deployment configuration.
+// Persistence files (CRITICAL: Pointing to root directory for Vercel deployment)
 const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, '..', 'state.json');
 const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, '..', 'user_tokens.json');
 
@@ -134,7 +133,7 @@ app.command('/availability', async ({ command, ack, respond }) => {
     }
     if (arg === 'status') {
       const status = getUserMode(uid) ? 'ON' : 'OFF';
-      // Fix: Use concatenation to avoid subtle template literal errors.
+      // Using concatenation to avoid persistent template literal errors
       await respond({ text: "Your guard is *" + status + "*.", response_type: 'ephemeral' });
       return;
     }
@@ -177,12 +176,11 @@ app.event('message', async ({ event, logger }) => {
 
       const uWeb = new WebClient(userToken);
 
-      // Check if the current channel is a DM involving the recipientId and the senderId
+      // This is a common pattern to check if the DM channel partner is the sender
       const info = await uWeb.conversations.info({ channel: event.channel });
       const partner = info?.channel?.user;
       if (partner !== senderId) continue;
 
-      // Don't reply if the message is from the user themselves or a bot
       if (event.user === recipientId || event.bot_id) return;
 
       const routeText = ROUTE_CHANNEL_ID
@@ -195,7 +193,6 @@ app.event('message', async ({ event, logger }) => {
         `If you are an internal stakeholder, feel free to use one of our shared channels as needed.\n` +
         `Otherwise, I will respond once I wrap up what I am currently working on. Appreciate your patience!`;
 
-      // Reply in thread
       await uWeb.chat.postMessage({ channel: event.channel, text, thread_ts: event.ts });
       break;
     }
@@ -207,13 +204,15 @@ app.event('message', async ({ event, logger }) => {
 // --- Minimal OAuth (User Tokens) via Express ---
 const http = express();
 
-const isVercel = OAUTH_HOST.includes('vercel.app');
-
+/**
+ * Generates the redirect URI based on environment (Vercel vs Local).
+ * Prioritizes HTTPS for Vercel environments.
+ */
 function generateRedirectUri() {
+  const isVercel = OAUTH_HOST !== 'localhost';
   const protocol = isVercel ? 'https' : 'http';
-  const host = OAUTH_HOST;
-  const portSegment = isVercel ? '' : `:${OAUTH_PORT}`;
-  return `${protocol}://${host}${portSegment}${OAUTH_REDIRECT_PATH}`;
+  const portSegment = (OAUTH_PORT && !isVercel) ? `:${OAUTH_PORT}` : '';
+  return `${protocol}://${OAUTH_HOST}${portSegment}${OAUTH_REDIRECT_PATH}`;
 }
 
 http.get('/', (_req, res) => {
@@ -225,14 +224,13 @@ http.get(OAUTH_INSTALL_PATH, (req, res) => {
     res.status(500).send('Missing SLACK_CLIENT_ID in .env');
     return;
   }
-
   const redirectUri = generateRedirectUri();
-  console.log(`[OAUTH] Redirecting to Slack Auth with URI: ${redirectUri}`); // Logging to aid Vercel debugging
+  console.log('[OAUTH] Redirecting to Slack Auth with URI:', redirectUri);
 
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     scope: 'commands',
-    user_scope: 'im:history,chat:write,users.profile:write,users.profile:read', // Added users.profile:read
+    user_scope: 'im:history,chat:write,users.profile:write',
     redirect_uri: redirectUri,
     state: STATE_SECRET || 'state-not-set'
   });
@@ -250,7 +248,6 @@ http.get(OAUTH_REDIRECT_PATH, async (req, res) => {
       res.status(500).send('Missing SLACK_CLIENT_ID or SLACK_CLIENT_SECRET in .env');
       return;
     }
-    
     const redirectUri = generateRedirectUri();
 
     const oauth = new WebClient().oauth;
@@ -283,21 +280,19 @@ http.get(OAUTH_REDIRECT_PATH, async (req, res) => {
 http.get('/health', (_req, res) => res.json({ ok: true }));
 
 // --- Start Socket Mode + HTTP (OAuth/health) ---
-// This immediate invocation is required for local development (npm run dev)
-// but Vercel requires the Express instance to be exported (below) for routing.
 (async () => {
-  // If running locally (not Vercel)
-  if (!process.env.VERCEL) {
-    await app.start(OAUTH_PORT);
-    console.log(`HTTP (OAuth/health) listening on http://${OAUTH_HOST}:${OAUTH_PORT}`);
-    console.log(`Install URL: http://${OAUTH_HOST}:${OAUTH_PORT}${OAUTH_INSTALL_PATH}`);
-    console.log('TPRM DM Redirect Bot is running (Socket Mode)...');
-  } else {
-    // If running on Vercel, the app starts implicitly via the web socket connection
-    console.log('Running in Vercel environment. HTTP routes are exported for routing.');
+  await app.start();
+  // We only run the HTTP listener locally. Vercel runs the HTTP server as a function.
+  if (OAUTH_HOST === 'localhost') {
+    http.listen(OAUTH_PORT, () => {
+      console.log(`HTTP (OAuth/health) listening on http://${OAUTH_HOST}:${OAUTH_PORT}`);
+      console.log(`Install URL: http://${OAUTH_HOST}:${OAUTH_PORT}${OAUTH_INSTALL_PATH}`);
+    });
   }
+  console.log('TPRM DM Redirect Bot is running (Socket Mode)...');
 })();
 
 // CRITICAL EXPORT FOR VERCEL
 // Vercel requires the Express instance (http) to be exported for routing to work.
+// The index.js wrapper file imports { http } and exports it.
 module.exports = { app, http };
