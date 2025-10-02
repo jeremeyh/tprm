@@ -1,0 +1,33 @@
+display_information:
+  name: TPRM DM Redirect Bot
+  description: Auto-reply in-thread to DMs when users are heads-down; toggled via /availability.
+  background_color: "#4A154B"
+
+features:
+  bot_user:
+    display_name: TPRM DM Redirect Bot
+    always_online: false
+  slash_commands:
+    - command: /availability
+      description: Toggle your guard (on/off/status). No arg toggles.
+      usage_hint: "[on|off|status]"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - commands
+    user:
+      - im:history
+      - chat:write
+      - users.profile:write
+
+settings:
+  event_subscriptions:
+    request_url: https://example.com/unused-for-socket-mode
+    user_events:
+      - message.im
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+  token_rotation_enabled: false
