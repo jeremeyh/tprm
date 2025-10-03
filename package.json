@@ -1,7 +1,7 @@
 {
   "name": "slack-dm-redirect-bot",
-  "version": "2.0.0",
-  "description": "Slack DM Redirect Bot (Express + Bolt) — Vercel HTTP mode safe",
+  "version": "2.1.0",
+  "description": "Slack DM Redirect Bot (Express + Bolt) with OAuth install routes for Vercel",
   "main": "app.js",
   "type": "commonjs",
   "scripts": {
@@ -12,7 +12,8 @@
     "@slack/bolt": "^3.17.1",
     "body-parser": "^1.20.3",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"
@@ -21,4 +22,3 @@
     "node": ">=18.0.0"
   }
 }
-
