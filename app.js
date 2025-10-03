@@ -60,13 +60,13 @@ function setUserMode(userId, isOn) {
   state.users[userId] = { on: !!isOn, updatedAt: Date.now() };
 }
 function getUserMode(userId) {
-  return !!(state.users[userId]?.on);
+  return !!(state.users[userId] && state.users[userId].on);
 }
 function saveUserToken(userId, token, team_id, enterprise_id) {
   users.by_user[userId] = { token, team_id, enterprise_id, updatedAt: Date.now() };
 }
 function getUserToken(userId) {
-  return users.by_user[userId]?.token || null;
+  return users.by_user[userId] ? users.by_user[userId].token : null;
 }
 function isTeamMember(uid) {
   return TEAM_USER_IDS.includes(uid);
@@ -151,8 +151,8 @@ http.get(OAUTH_REDIRECT_PATH, async (req, res) => {
     const authedUser = result.authed_user || {};
     const userId     = authedUser.id;
     const userToken  = authedUser.access_token;
-    const team_id    = result.team?.id;
-    const enterprise_id = result.enterprise?.id;
+    const team_id    = result.team && result.team.id;
+    const enterprise_id = result.enterprise && result.enterprise.id;
 
     if (!userId || !userToken) {
       return res
@@ -197,7 +197,9 @@ function wireBoltHandlers(boltApp) {
               status_expiration: 0
             }
           });
-        } catch (e) { console.warn('users.profile.set failed:', e?.data?.error || e.message); }
+        } catch (e) {
+          console.warn('users.profile.set failed:', (e && e.data && e.data.error) || e.message);
+        }
       };
 
       if (['on','enable','start'].includes(arg)) {
@@ -205,7 +207,122 @@ function wireBoltHandlers(boltApp) {
         await applyStatus(true);
         return respond({ text: 'Heads-down is *ON*. I will auto-reply in DMs.', response_type: 'ephemeral' });
       }
+
       if (['off','disable','stop'].includes(arg)) {
         setUserMode(uid, false);
         await applyStatus(false);
-        return respond({ text: 'Heads-down is *OFF*. I will not auto-rep
+        return respond({ text: 'Heads-down is *OFF*. I will not auto-reply in DMs.', response_type: 'ephemeral' });
+      }
+
+      if (arg === 'status') {
+        const s = getUserMode(uid) ? 'ON' : 'OFF';
+        return respond({ text: `Your heads-down is *${s}*.`, response_type: 'ephemeral' });
+      }
+
+      // default: toggle
+      const next = !getUserMode(uid);
+      setUserMode(uid, next);
+      await applyStatus(next);
+      return respond({ text: `Toggled. Heads-down is now *${next ? 'ON' : 'OFF'}*.`, response_type: 'ephemeral' });
+    } catch (e) {
+      console.error('/availability error:', e);
+    }
+  });
+
+  // DM auto-reply: post in thread to DMs sent to team members who are ON
+  boltApp.event('message', async ({ event, logger }) => {
+    try {
+      if (!event || event.subtype) return;
+      if (event.channel_type !== 'im') return;       // 1:1 only
+      if (event.thread_ts) return;                   // avoid loops in threads
+      const senderId = event.user;
+      if (!senderId) return;
+
+      for (const recipientId of TEAM_USER_IDS) {
+        if (!getUserMode(recipientId)) continue;
+        const token = getUserToken(recipientId);
+        if (!token) continue;
+
+        const uWeb = new WebClient(token);
+
+        // Check DM partner
+        const info = await uWeb.conversations.info({ channel: event.channel });
+        const partner = info && info.channel && info.channel.user;
+        if (partner !== senderId) continue;
+
+        if (senderId === recipientId || event.bot_id) return;
+
+        const routeText = ROUTE_CHANNEL_ID
+          ? `<#${ROUTE_CHANNEL_ID}|${ROUTE_CHANNEL_NAME}>`
+          : ROUTE_CHANNEL_NAME;
+
+        const text =
+          'Hi there, thanks for reaching out. I am currently heads down in deep work mode and not checking messages in real time.\n' +
+          `For quicker support, please post your question in ${routeText} so a teammate can jump in.\n` +
+          "Otherwise, I will respond once I wrap up what I'm working on. Appreciate your patience!";
+
+        await uWeb.chat.postMessage({ channel: event.channel, text, thread_ts: event.ts });
+        break;
+      }
+    } catch (e) { if (logger && logger.error) logger.error(e); }
+  });
+}
+
+// -------------------------
+// Mode selection (Socket locally, HTTP on Vercel or if no APP_TOKEN)
+// -------------------------
+let boltApp = null;
+(async () => {
+  if (!IS_VERCEL && APP_TOKEN) {
+    // -------- Local Socket Mode --------
+    boltApp = new App({
+      token: BOT_TOKEN,
+      signingSecret: SIGNING_SECRET,
+      appToken: APP_TOKEN,
+      socketMode: true,
+      logLevel: LogLevel.INFO
+    });
+    wireBoltHandlers(boltApp);
+
+    await boltApp.start(); // WebSocket connect
+    http.listen(OAUTH_PORT, () => {
+      console.log(`[local-socket] OAuth/health on http://localhost:${OAUTH_PORT}`);
+      console.log(`[local-socket] Install URL: http://localhost:${OAUTH_PORT}${OAUTH_INSTALL_PATH}`);
+    });
+    console.log('TPRM bot running (Socket Mode).');
+  } else {
+    // -------- HTTP Mode (Vercel-friendly and local fallback) --------
+    const receiver = new ExpressReceiver({
+      signingSecret: SIGNING_SECRET,
+      processBeforeResponse: true,
+      endpoints: '/api/slack/events'
+    });
+
+    boltApp = new App({
+      token: BOT_TOKEN,
+      signingSecret: SIGNING_SECRET,
+      receiver,
+      logLevel: LogLevel.INFO
+    });
+    wireBoltHandlers(boltApp);
+
+    // Mount Bolt router into our Express app
+    http.use(receiver.router);
+
+    if (!IS_VERCEL) {
+      http.listen(OAUTH_PORT, () => {
+        console.log(`[local-http] Server on http://localhost:${OAUTH_PORT}`);
+        console.log(`[local-http] Install URL: http://localhost:${OAUTH_PORT}${OAUTH_INSTALL_PATH}`);
+        console.log(`[local-http] Events at /api/slack/events (tunnel required for Slack callbacks)`);
+      });
+    } else {
+      console.log('TPRM bot initialized (HTTP mode, Vercel).');
+    }
+  }
+})();
+
+// -------------------------
+// Export for Vercel (serve the Express app)
+// -------------------------
+module.exports = http;
+module.exports.default = http;
