@@ -2,23 +2,22 @@
   "name": "slack-dm-redirect-bot",
   "version": "2.1.0",
   "description": "Slack DM Redirect Bot (Express + Bolt) with OAuth install routes for Vercel",
-  "main": "app.js",
+  "private": true,
   "type": "commonjs",
+  "main": "app.js",
+  "engines": { "node": ">=20" },
   "scripts": {
-    "dev": "nodemon --watch . --ext js,json --exec \"node app.js\"",
+    "dev": "nodemon --watch . --ext js,json --exec node app.js",
     "start": "node app.js"
   },
   "dependencies": {
     "@slack/bolt": "^3.17.1",
-    "body-parser": "^1.20.3",
+    "@slack/web-api": "^6.12.0",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
+    "express": "^4.19.2"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
+
