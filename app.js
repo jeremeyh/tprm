@@ -1,93 +1,104 @@
-// app.js — HTTP (ExpressReceiver) for Vercel with /api/slack/* endpoints
+// app.js — TPRM DM Redirect Bot (Socket Mode + Express routes)
+// -------------------------------------------------------------
 require('dotenv').config();
 
-const { App, ExpressReceiver, LogLevel } = require('@slack/bolt');
+const { App, LogLevel, ExpressReceiver } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
+const express = require('express');
 
-// ---------------- Env / Config ----------------
+// -------------------- Env & basic config --------------------
 const BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
 const SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const APP_TOKEN      = process.env.SLACK_APP_TOKEN;      // xapp-... (Socket Mode)
 
 const CLIENT_ID      = process.env.SLACK_CLIENT_ID;
 const CLIENT_SECRET  = process.env.SLACK_CLIENT_SECRET;
 const STATE_SECRET   = process.env.SLACK_STATE_SECRET || 'state-not-set';
 
 const TEAM_NAME            = process.env.TEAM_NAME || 'Team';
+const ROUTE_CHANNEL_ID     = process.env.ROUTE_CHANNEL_ID || '';      // e.g. C123...
 const ROUTE_CHANNEL_NAME   = process.env.ROUTE_CHANNEL_NAME || '#team-channel';
-const ROUTE_CHANNEL_ID     = process.env.ROUTE_CHANNEL_ID || '';
-
 const STATUS_EMOJI         = process.env.STATUS_EMOJI || ':no_bell:';
-const STATUS_TEXT          = process.env.STATUS_TEXT || `Heads-down — please post in ${ROUTE_CHANNEL_NAME}`;
+const STATUS_TEXT          = process.env.STATUS_TEXT  || `Heads-down — please post in ${ROUTE_CHANNEL_NAME}`;
 
-// Normalize Slack IDs (strip whitespace/hidden chars; uppercase A–Z0–9)
-const norm = (s = '') => s.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+const PORT   = Number(process.env.OAUTH_PORT || 3000);
+const IS_VERCEL = !!process.env.VERCEL; // present on Vercel
+const HOST   = process.env.VERCEL_URL
+  ? process.env.VERCEL_URL.replace(/^https?:\/\//, '')
+  : (process.env.OAUTH_REDIRECT_HOST || `localhost`);
 
-// Parse env list once; keep as a Set for O(1) membership checks
-const TEAM_USER_ID_SET = new Set(
-  (process.env.TEAM_USER_IDS || '')
-    .split(',')
-    .map(norm)
-    .filter(Boolean)
-);
-const isTeamMember = (uid) => TEAM_USER_ID_SET.has(norm(uid));
-
-// If critical env is missing, export a tiny app so Vercel doesn’t 500-loop
-if (!BOT_TOKEN || !SIGNING_SECRET) {
-  const express = require('express');
-  const fail = express();
-  fail.get(['/health', '/api/health'], (_req, res) =>
-    res.status(500).json({ ok: false, reason: 'Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET' })
-  );
-  module.exports = fail;
-  module.exports.default = fail;
-  return;
+// Required tokens guard (only for local/dev; Vercel will log if missing)
+if (!BOT_TOKEN || !SIGNING_SECRET || !APP_TOKEN) {
+  console.error('[DM-Redirect] Missing required Slack env(s): SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_APP_TOKEN');
+  if (!IS_VERCEL) process.exit(1);
 }
 
-// ---------------- In-memory persistence ----------------
-// (Stateless on Vercel; survives only for the life of the function)
-let state = { users: {} };   // { U123: { on, updatedAt } }
-let users = { by_user: {} }; // { U123: { token, team_id, enterprise_id, updatedAt } }
+// -------------------- Allow list (normalized) --------------------
+const norm = (s = '') => s.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+const RAW_TEAM_USER_IDS = process.env.TEAM_USER_IDS || '';
+const TEAM_USER_ID_SET = new Set(
+  RAW_TEAM_USER_IDS.split(',').map(norm).filter(Boolean)
+);
 
-const setUserMode   = (uid, on) => { state.users[uid] = { on: !!on, updatedAt: Date.now() }; };
-const getUserMode   = (uid) => !!(state.users?.[uid]?.on);
-const saveUserToken = (uid, token, team_id, enterprise_id) =>
-  (users.by_user[uid] = { token, team_id, enterprise_id, updatedAt: Date.now() });
-const getUserToken  = (uid) => users?.by_user?.[uid]?.token || null;
+if (TEAM_USER_ID_SET.size === 0) {
+  console.warn('[DM-Redirect] TEAM_USER_IDS normalized to EMPTY. RAW:', RAW_TEAM_USER_IDS);
+}
+const isTeamMember = (uid) => TEAM_USER_ID_SET.has(norm(uid));
 
-// ---------------- Bolt via ExpressReceiver (HTTP mode) ----------------
+// -------------------- Minimal persistence (in-memory) --------------------
+let state = { users: {} };            // { users: { U123: { on, updatedAt } } }
+let users = { by_user: {} };          // { by_user: { U123: { token, team_id, enterprise_id, updatedAt } } }
+
+const setUserMode = (userId, isOn) => { state.users[userId] = { on: !!isOn, updatedAt: Date.now() }; };
+const getUserMode = (userId) => !!(state.users?.[userId]?.on);
+
+const getUserToken = (userId) => users?.by_user?.[userId]?.token || null;
+const saveUserToken = (userId, token, team_id, enterprise_id) => {
+  users.by_user = users.by_user || {};
+  users.by_user[userId] = { token, team_id, enterprise_id, updatedAt: Date.now() };
+};
+
+// -------------------- Bolt (Socket Mode) --------------------
+// We pass an ExpressReceiver so we can mount custom HTTP routes easily.
+// Socket Mode handles Slack traffic; receiver’s express app serves our OAuth/debug routes.
 const receiver = new ExpressReceiver({
   signingSecret: SIGNING_SECRET,
-  // IMPORTANT: match your Slack settings exactly
-  endpoints: {
-    events:   '/api/slack/events',
-    commands: '/api/slack/commands',
-    actions:  '/api/slack/interactive',
-  },
+  processBeforeResponse: true,
 });
 
 const app = new App({
   token: BOT_TOKEN,
+  signingSecret: SIGNING_SECRET,
+  appToken: APP_TOKEN,
+  socketMode: true,
   receiver,
   logLevel: LogLevel.INFO,
 });
 
 const botWeb = new WebClient(BOT_TOKEN);
 
-// ---------------- Slash command: /availability ----------------
+// -------------------- Slash: /availability --------------------
 app.command('/availability', async ({ command, ack, respond }) => {
-  await ack(); // prevents "dispatch_failed"
+  await ack(); // critical to avoid "dispatch_failed"
 
   try {
-    const uid = command.user_id;
+    const uid = command.user_id || '';
     const allowed = isTeamMember(uid);
 
-    // Debug (view in Vercel Runtime Logs if needed)
-    // console.log('Slash /availability from:', uid, 'Allowed IDs:', Array.from(TEAM_USER_ID_SET));
+    // Always log the decision & the normalized list actually loaded in this deploy
+    console.log('[DM-Redirect]/availability',
+      { uid, allowed, raw: RAW_TEAM_USER_IDS, normalized: Array.from(TEAM_USER_ID_SET) }
+    );
 
     if (!allowed) {
+      const preview = Array.from(TEAM_USER_ID_SET).slice(0, 6).join(', ') || '(empty)';
       return respond({
-        text: `You're not on the managed team list for ${TEAM_NAME}.`,
         response_type: 'ephemeral',
+        text:
+          `You're not on the managed team list for *${TEAM_NAME}*.\n` +
+          `• Your UID: \`${uid}\`\n` +
+          `• Allow-list (first few): \`${preview}\`\n` +
+          `If this is wrong, update TEAM_USER_IDS in Vercel env and redeploy.`,
       });
     }
 
@@ -98,30 +109,28 @@ app.command('/availability', async ({ command, ack, respond }) => {
     const setStatus = async (emoji, text) => {
       if (!uWeb) return;
       try {
-        await uWeb.users.profile.set({
-          profile: { status_emoji: emoji, status_text: text, status_expiration: 0 },
-        });
+        await uWeb.users.profile.set({ profile: { status_emoji: emoji, status_text: text, status_expiration: 0 } });
       } catch (e) {
-        console.error('users.profile.set failed:', e?.data || e?.message || e);
+        console.error('[DM-Redirect] users.profile.set failed:', e?.data || e?.message || e);
       }
     };
 
     if (['on', 'enable', 'start'].includes(arg)) {
       setUserMode(uid, true);
       await setStatus(STATUS_EMOJI, STATUS_TEXT);
-      return respond({ text: 'Heads-down is *ON*. I will auto-reply in DMs.', response_type: 'ephemeral' });
+      return respond({ response_type: 'ephemeral', text: 'Heads-down is *ON*. I will auto-reply in DMs.' });
     }
 
     if (['off', 'disable', 'stop'].includes(arg)) {
       setUserMode(uid, false);
       await setStatus('', '');
-      return respond({ text: 'Heads-down is *OFF*. I will not auto-reply in DMs.', response_type: 'ephemeral' });
+      return respond({ response_type: 'ephemeral', text: 'Heads-down is *OFF*. I will not auto-reply in DMs.' });
     }
 
     if (arg === 'status') {
       return respond({
-        text: `Your heads-down guard is *${getUserMode(uid) ? 'ON' : 'OFF'}*.`,
         response_type: 'ephemeral',
+        text: `Your heads-down guard is *${getUserMode(uid) ? 'ON' : 'OFF'}*.`,
       });
     }
 
@@ -130,53 +139,48 @@ app.command('/availability', async ({ command, ack, respond }) => {
     setUserMode(uid, now);
     await setStatus(now ? STATUS_EMOJI : '', now ? STATUS_TEXT : '');
     return respond({
-      text: `Toggled. Heads-down is now *${now ? 'ON' : 'OFF'}*.`,
       response_type: 'ephemeral',
+      text: `Toggled. Heads-down is now *${now ? 'ON' : 'OFF'}*.`,
     });
   } catch (e) {
     console.error('/availability error:', e);
-    return respond({ text: 'Something went wrong handling /availability.', response_type: 'ephemeral' });
+    return respond({ response_type: 'ephemeral', text: 'Something went wrong handling /availability.' });
   }
 });
 
-// ---------------- DM auto-reply (threaded) ----------------
+// -------------------- DM auto-reply (threaded, DM-only) --------------------
 app.event('message', async ({ event, logger }) => {
   try {
     if (!event || event.subtype) return;
-    if (event.channel_type !== 'im') return;
-    if (event.thread_ts) return;
+    if (event.channel_type !== 'im') return;     // only 1:1 DMs
+    if (event.thread_ts) return;                 // don’t loop in threads
+    if (!event.user) return;
 
     const senderId = event.user;
-    if (!senderId) return;
 
+    // For each managed user that has guard ON and has a user token
     for (const recipientId of TEAM_USER_ID_SET) {
       if (!getUserMode(recipientId)) continue;
-
       const userToken = getUserToken(recipientId);
       if (!userToken) continue;
 
       const uWeb = new WebClient(userToken);
 
-      // Guard: ensure the DM is with the intended recipient
-      try {
-        const info = await uWeb.conversations.info({ channel: event.channel });
-        const partner = info?.channel?.user;
-        if (partner !== senderId) continue;
-      } catch (e) {
-        // If info fails for permissions, don't crash the flow; continue
-        logger?.warn?.('conversations.info failed, skipping partner check:', e?.data || e?.message || e);
-      }
+      // Make sure this DM is between sender and recipient
+      const info = await uWeb.conversations.info({ channel: event.channel });
+      const partner = info?.channel?.user;
+      if (partner !== senderId) continue;
 
-      if (event.user === recipientId || event.bot_id) return;
+      if (senderId === recipientId || event.bot_id) return;
 
       const routeText = ROUTE_CHANNEL_ID
         ? `<#${ROUTE_CHANNEL_ID}|${ROUTE_CHANNEL_NAME}>`
         : ROUTE_CHANNEL_NAME;
 
       const text =
-        `Hi there — I'm currently heads down and not checking messages in real time.\n` +
-        `For quicker support, please post your question in ${routeText} so a teammate can jump in.\n` +
-        `I'll reply once I wrap up. Thanks!`;
+        `Hi there — I’m currently heads-down and not checking DMs in real time.\n` +
+        `For quicker support, please post in ${routeText} and a teammate will jump in.\n` +
+        `Otherwise I’ll follow up when I’m back. Thanks!`;
 
       await uWeb.chat.postMessage({ channel: event.channel, text, thread_ts: event.ts });
       break;
@@ -186,68 +190,79 @@ app.event('message', async ({ event, logger }) => {
   }
 });
 
-// ---------------- OAuth: /slack/install & /slack/oauth_redirect ----------------
-const http = receiver.app;
+// -------------------- OAuth (install + redirect) --------------------
+function redirectUri() {
+  const isProd = !!process.env.VERCEL_URL;
+  const proto = isProd ? 'https' : 'http';
+  const host  = HOST.replace(/^https?:\/\//, '');
+  const portSeg = (!isProd && PORT) ? `:${PORT}` : '';
+  return `${proto}://${host}${portSeg}/slack/oauth_redirect`;
+}
 
-const buildRedirectUri = (req) => {
-  const host  = req.headers['x-forwarded-host'] || req.headers.host;
-  const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0];
-  return `${proto}://${host}/api/slack/oauth_redirect`;
-};
+receiver.app.get('/', (_req, res) => {
+  res.send('TPRM DM Redirect Bot is running. Visit /slack/install to authorize a user.');
+});
 
-const installHandler = (req, res) => {
+receiver.app.get('/slack/install', (_req, res) => {
   if (!CLIENT_ID) return res.status(500).send('Missing SLACK_CLIENT_ID');
-  const redirectUri = buildRedirectUri(req);
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     scope: 'commands',
     user_scope: 'im:history,chat:write,users.profile:write',
-    redirect_uri: redirectUri,
+    redirect_uri: redirectUri(),
     state: STATE_SECRET,
   });
   res.redirect(`https://slack.com/oauth/v2/authorize?${params.toString()}`);
-};
+});
 
-const oauthRedirectHandler = async (req, res) => {
+receiver.app.get('/slack/oauth_redirect', async (req, res) => {
   try {
     const code = req.query.code;
-    if (!code) return res.status(400).send('Missing ?code param');
+    if (!code) return res.status(400).send('Missing ?code');
+    if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('Missing CLIENT_ID/CLIENT_SECRET');
 
-    if (!CLIENT_ID || !CLIENT_SECRET) {
-      return res.status(500).send('Missing SLACK_CLIENT_ID/SLACK_CLIENT_SECRET');
-    }
-
-    const redirectUri = buildRedirectUri(req);
-    const result = await new WebClient().oauth.v2.access({
+    const oauth = new WebClient().oauth;
+    const out = await oauth.v2.access({
       client_id: CLIENT_ID,
       client_secret: CLIENT_SECRET,
       code,
-      redirect_uri: redirectUri,
+      redirect_uri: redirectUri(),
     });
 
-    const au = result.authed_user || {};
-    if (!au.id || !au.access_token) {
-      return res
-        .status(200)
-        .send('<h3>OAuth complete, but no user token was returned. Ensure user scopes are granted.</h3>');
-    }
+    const authed = out.authed_user || {};
+    const userId = authed.id;
+    const token  = authed.access_token;
+    saveUserToken(userId, token, out.team?.id, out.enterprise?.id);
 
-    saveUserToken(au.id, au.access_token, result.team?.id, result.enterprise?.id);
-    return res.status(200).send(`<h3>Success!</h3><p>Saved user token for ${au.id}. You can close this window.</p>`);
-  } catch (err) {
-    console.error('OAuth error:', err?.data || err?.message || err);
-    return res.status(500).send('OAuth failed. Check logs.');
+    res.status(200).send(`<h1>Success!</h1><p>Saved user token for ${userId}. You can close this window.</p>`);
+  } catch (e) {
+    console.error('OAuth error:', e?.data || e?.message || e);
+    res.status(500).send('OAuth failed. Check logs.');
   }
-};
+});
 
-// Health + simple index
-http.get(['/health', '/api/health'], (_req, res) => res.json({ ok: true }));
-http.get('/', (_req, res) => res.send('TPRM DM Redirect Bot is running. Visit /slack/install to authorize a user.'));
+// -------------------- Debug route --------------------
+receiver.app.get('/api/debug/team', (_req, res) => {
+  res.json({
+    team_name: TEAM_NAME,
+    raw_env: RAW_TEAM_USER_IDS,
+    normalized: Array.from(TEAM_USER_ID_SET),
+    has_tokens_for: Object.keys(users.by_user || {}),
+  });
+});
 
-// Route aliases for both /slack/* and /api/slack/*
-http.get(['/slack/install', '/api/slack/install'], installHandler);
-http.get(['/slack/oauth_redirect', '/api/slack/oauth_redirect'], oauthRedirectHandler);
+// -------------------- Start Socket Mode & HTTP --------------------
+(async () => {
+  await app.start();
+  console.log('[DM-Redirect] Slack Socket Mode started.');
 
-// ---------------- Export for Vercel ----------------
-module.exports = http;
-module.exports.default = http;
+  if (!IS_VERCEL) {
+    receiver.app.listen(PORT, () => {
+      console.log(`[DM-Redirect] HTTP listening on http://localhost:${PORT}`);
+      console.log(`[DM-Redirect] Install URL: http://localhost:${PORT}/slack/install`);
+    });
+  }
+})();
+
+// Export the Express app so Vercel can route to it
+module.exports = receiver.app;
