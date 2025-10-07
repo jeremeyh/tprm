@@ -176,7 +176,7 @@ boltApp.event('message', async ({ event, logger }) => {
       const userToken = getUserToken(recipientId);
       if (!userToken) continue;
 
-    const uWeb = new WebClient(userToken);
+      const uWeb = new WebClient(userToken);
 
       // Ensure this DM is with the intended recipient
       try {
@@ -189,19 +189,11 @@ boltApp.event('message', async ({ event, logger }) => {
 
       if (senderId === recipientId || event.bot_id) return;
 
-      // ----- PATCH: render a clean #channel mention -----
+      // Build a true channel mention (Slack renders with the real #name)
       const routeText = (() => {
-        if (ROUTE_CHANNEL_ID) {
-          const visible = ROUTE_CHANNEL_NAME.startsWith('#')
-            ? ROUTE_CHANNEL_NAME
-            : `#${ROUTE_CHANNEL_NAME}`;
-          // Visible label as "#name" while still a real channel mention
-          return `<#${ROUTE_CHANNEL_ID}|${visible}>`;
-        }
-        // Fallback to plain "#name" which Slack will auto-link with link_names
-        return ROUTE_CHANNEL_NAME.startsWith('#')
-          ? ROUTE_CHANNEL_NAME
-          : `#${ROUTE_CHANNEL_NAME}`;
+        if (ROUTE_CHANNEL_ID) return `<#${ROUTE_CHANNEL_ID}>`;
+        const cleanName = ROUTE_CHANNEL_NAME.replace(/^#/, '');
+        return `#${cleanName}`;
       })();
 
       const text =
@@ -214,11 +206,12 @@ boltApp.event('message', async ({ event, logger }) => {
         text,
         thread_ts: event.ts,
         mrkdwn: true,
+        // force Slack to resolve mentions/links
+        parse: 'full',
         link_names: true,
         unfurl_links: false,
         unfurl_media: false,
       });
-      // -----------------------------------------------
       break;
     }
   } catch (e) {
