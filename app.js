@@ -14,11 +14,11 @@ const CLIENT_ID      = process.env.SLACK_CLIENT_ID;
 const CLIENT_SECRET  = process.env.SLACK_CLIENT_SECRET;
 const STATE_SECRET   = process.env.SLACK_STATE_SECRET || 'state-not-set';
 
-const TEAM_NAME            = process.env.TEAM_NAME || 'Team';
-const ROUTE_CHANNEL_ID     = process.env.ROUTE_CHANNEL_ID || '';
-const ROUTE_CHANNEL_NAME   = process.env.ROUTE_CHANNEL_NAME || '#team-channel';
-const STATUS_EMOJI         = process.env.STATUS_EMOJI || ':no_bell:';
-const STATUS_TEXT          = process.env.STATUS_TEXT  || `Heads-down — please post in ${ROUTE_CHANNEL_NAME}`;
+const TEAM_NAME          = process.env.TEAM_NAME || 'Team';
+const ROUTE_CHANNEL_ID   = process.env.ROUTE_CHANNEL_ID || '';
+const ROUTE_CHANNEL_NAME = process.env.ROUTE_CHANNEL_NAME || '#team-channel';
+const STATUS_EMOJI       = process.env.STATUS_EMOJI || ':no_bell:';
+const STATUS_TEXT        = process.env.STATUS_TEXT  || `Heads-down — please post in ${ROUTE_CHANNEL_NAME}`;
 
 const PORT   = Number(process.env.OAUTH_PORT || 3000);
 const IS_VERCEL = !!process.env.VERCEL;
@@ -33,7 +33,7 @@ if (!BOT_TOKEN || !SIGNING_SECRET) {
 }
 
 // ---------------- Allow-list (normalized) ----------------
-const norm = (s='') => s.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+const norm = (s = '') => s.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 const RAW_TEAM_USER_IDS = process.env.TEAM_USER_IDS || '';
 const TEAM_USER_ID_SET = new Set(RAW_TEAM_USER_IDS.split(',').map(norm).filter(Boolean));
 const isTeamMember = (uid) => TEAM_USER_ID_SET.has(norm(uid));
@@ -130,13 +130,13 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
       }
     };
 
-    if (['on','enable','start'].includes(arg)) {
+    if (['on', 'enable', 'start'].includes(arg)) {
       setUserMode(uid, true);
       await setStatus(STATUS_EMOJI, STATUS_TEXT);
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *ON*. I will auto-reply in DMs.' });
     }
 
-    if (['off','disable','stop'].includes(arg)) {
+    if (['off', 'disable', 'stop'].includes(arg)) {
       setUserMode(uid, false);
       await setStatus('', '');
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *OFF*. I will not auto-reply in DMs.' });
@@ -264,6 +264,28 @@ webApp.get('/api/debug/team', (_req, res) => {
   });
 });
 
+// --- Debug: show exact OAuth redirect URI the app will use
+webApp.get('/slack/redirect_uri', (_req, res) => {
+  res.type('text/plain').send(redirectUri());
+});
+
+// --- Debug: list all Slack endpoints to copy/paste into the Slack App config
+webApp.get('/api/debug/urls', (_req, res) => {
+  const isProd  = !!process.env.VERCEL_URL;
+  const proto   = isProd ? 'https' : 'http';
+  const host    = HOST.replace(/^https?:\/\//, '');
+  const portSeg = (!isProd && PORT) ? `:${PORT}` : '';
+  const base    = `${proto}://${host}${portSeg}`;
+
+  res.json({
+    install:        `${base}/slack/install`,
+    oauth_redirect: `${base}/slack/oauth_redirect`,
+    events:         `${base}/api/slack/events`,
+    commands:       `${base}/api/slack/commands`,
+    interactive:    `${base}/api/slack/interactive`,
+  });
+});
+
 // ---------------- Start ----------------
 (async () => {
   await boltApp.start();
@@ -273,6 +295,7 @@ webApp.get('/api/debug/team', (_req, res) => {
   if (!IS_VERCEL) {
     webApp.listen(PORT, () => {
       console.log(`HTTP listening on http://localhost:${PORT}`);
+      console.log(`OAuth Redirect: ${redirectUri()}`);
       console.log(`Install URL: http://localhost:${PORT}/slack/install`);
       console.log(`Events URL:  http://localhost:${PORT}/api/slack/events`);
       console.log(`Cmd URL:     http://localhost:${PORT}/api/slack/commands`);
