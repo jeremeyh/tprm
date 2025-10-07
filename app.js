@@ -20,9 +20,9 @@ const ROUTE_CHANNEL_NAME = process.env.ROUTE_CHANNEL_NAME || '#team-channel';
 const STATUS_EMOJI       = process.env.STATUS_EMOJI || ':no_bell:';
 const STATUS_TEXT        = process.env.STATUS_TEXT  || `Heads-down — please post in ${ROUTE_CHANNEL_NAME}`;
 
-const PORT   = Number(process.env.OAUTH_PORT || 3000);
+const PORT     = Number(process.env.OAUTH_PORT || 3000);
 const IS_VERCEL = !!process.env.VERCEL;
-const HOST   = process.env.VERCEL_URL
+const HOST = process.env.VERCEL_URL
   ? process.env.VERCEL_URL.replace(/^https?:\/\//, '')
   : (process.env.OAUTH_REDIRECT_HOST || 'localhost');
 
@@ -227,10 +227,15 @@ webApp.get('/slack/install', (_req, res) => {
   res.redirect(`https://slack.com/oauth/v2/authorize?${params.toString()}`);
 });
 
+// ✅ Updated handler with `state` validation
 webApp.get('/slack/oauth_redirect', async (req, res) => {
   try {
-    const code = req.query.code;
+    const { code, state } = req.query;
+
     if (!code) return res.status(400).send('Missing ?code');
+    if (state !== STATE_SECRET) {
+      return res.status(400).send('Invalid state');
+    }
     if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('Missing CLIENT_ID/CLIENT_SECRET');
 
     const oauth = new WebClient().oauth;
