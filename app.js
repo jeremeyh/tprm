@@ -176,7 +176,7 @@ boltApp.event('message', async ({ event, logger }) => {
       const userToken = getUserToken(recipientId);
       if (!userToken) continue;
 
-      const uWeb = new WebClient(userToken);
+    const uWeb = new WebClient(userToken);
 
       // Ensure this DM is with the intended recipient
       try {
@@ -189,16 +189,36 @@ boltApp.event('message', async ({ event, logger }) => {
 
       if (senderId === recipientId || event.bot_id) return;
 
-      const routeText = ROUTE_CHANNEL_ID
-        ? `<#${ROUTE_CHANNEL_ID}|${ROUTE_CHANNEL_NAME}>`
-        : ROUTE_CHANNEL_NAME;
+      // ----- PATCH: render a clean #channel mention -----
+      const routeText = (() => {
+        if (ROUTE_CHANNEL_ID) {
+          const visible = ROUTE_CHANNEL_NAME.startsWith('#')
+            ? ROUTE_CHANNEL_NAME
+            : `#${ROUTE_CHANNEL_NAME}`;
+          // Visible label as "#name" while still a real channel mention
+          return `<#${ROUTE_CHANNEL_ID}|${visible}>`;
+        }
+        // Fallback to plain "#name" which Slack will auto-link with link_names
+        return ROUTE_CHANNEL_NAME.startsWith('#')
+          ? ROUTE_CHANNEL_NAME
+          : `#${ROUTE_CHANNEL_NAME}`;
+      })();
 
       const text =
         `Hi there — I’m currently heads-down and not checking DMs in real time.\n` +
         `For quicker support, please post in ${routeText} and a teammate will jump in.\n` +
         `Otherwise I’ll follow up when I’m back. Thanks!`;
 
-      await uWeb.chat.postMessage({ channel: event.channel, text, thread_ts: event.ts });
+      await uWeb.chat.postMessage({
+        channel: event.channel,
+        text,
+        thread_ts: event.ts,
+        mrkdwn: true,
+        link_names: true,
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+      // -----------------------------------------------
       break;
     }
   } catch (e) {
