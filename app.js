@@ -20,11 +20,15 @@ const ROUTE_CHANNEL_NAME = process.env.ROUTE_CHANNEL_NAME || '#team-channel';
 const STATUS_EMOJI       = process.env.STATUS_EMOJI || ':no_bell:';
 const STATUS_TEXT        = process.env.STATUS_TEXT  || `Heads-down — please post in ${ROUTE_CHANNEL_NAME}`;
 
-const PORT     = Number(process.env.OAUTH_PORT || 3000);
+const PORT      = Number(process.env.OAUTH_PORT || 3000);
 const IS_VERCEL = !!process.env.VERCEL;
-const HOST = process.env.VERCEL_URL
-  ? process.env.VERCEL_URL.replace(/^https?:\/\//, '')
-  : (process.env.OAUTH_REDIRECT_HOST || 'localhost');
+
+// Prefer explicit override, else fall back to Vercel URL or localhost
+const HOST = (process.env.OAUTH_REDIRECT_HOST || (
+  process.env.VERCEL_URL
+    ? process.env.VERCEL_URL.replace(/^https?:\/\//, '')
+    : 'localhost'
+));
 
 // Fail fast locally if critical env missing
 if (!BOT_TOKEN || !SIGNING_SECRET) {
@@ -227,15 +231,13 @@ webApp.get('/slack/install', (_req, res) => {
   res.redirect(`https://slack.com/oauth/v2/authorize?${params.toString()}`);
 });
 
-// ✅ Updated handler with `state` validation
+// ✅ OAuth redirect with state validation
 webApp.get('/slack/oauth_redirect', async (req, res) => {
   try {
     const { code, state } = req.query;
 
     if (!code) return res.status(400).send('Missing ?code');
-    if (state !== STATE_SECRET) {
-      return res.status(400).send('Invalid state');
-    }
+    if (state !== STATE_SECRET) return res.status(400).send('Invalid state');
     if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('Missing CLIENT_ID/CLIENT_SECRET');
 
     const oauth = new WebClient().oauth;
