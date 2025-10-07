@@ -5,9 +5,7 @@
   "private": true,
   "type": "commonjs",
   "main": "app.js",
-  "engines": {
-    "node": ">=20"
-  },
+  "engines": { "node": ">=20" },
   "scripts": {
     "dev": "nodemon --watch . --ext js,json --exec node app.js",
     "start": "node app.js"
@@ -24,8 +22,12 @@
   },
   "overrides": {
     "semver": "^7.6.3",
-    "@vercel/remix-builder>semver": "^7.6.3",
-    "@vercel/redwood>semver": "^7.6.3",
+    "@vercel/remix-builder": {
+      "semver": "^7.6.3"
+    },
+    "@vercel/redwood": {
+      "semver": "^7.6.3"
+    },
     "degenerator": "^5.0.1"
   }
 }
