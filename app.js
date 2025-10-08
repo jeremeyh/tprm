@@ -4,6 +4,7 @@ require('dotenv').config();
 const { App, LogLevel, ExpressReceiver } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
 const express = require('express');
+const fetch = require('node-fetch'); // present on Vercel; works locally too
 
 // ---------------- Env ----------------
 const BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
@@ -30,6 +31,11 @@ const HOST = (process.env.OAUTH_REDIRECT_HOST || (
     : 'localhost'
 ));
 
+// KV (Upstash / Vercel KV via REST)
+const KV_URL   = process.env.UPSTASH_REDIS_REST_URL || '';
+const KV_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const KV_ENABLED = !!(KV_URL && KV_TOKEN);
+
 // Fail fast locally if critical env missing
 if (!BOT_TOKEN || !SIGNING_SECRET) {
   console.error('Missing SLACK_BOT_TOKEN or SLACK_SIGNING_SECRET');
@@ -46,27 +52,98 @@ if (TEAM_USER_ID_SET.size === 0) {
   console.warn('[DM-Redirect] TEAM_USER_IDS normalized to EMPTY. RAW:', RAW_TEAM_USER_IDS);
 }
 
-// ---------------- In-memory persistence ----------------
-let state = { users: {} };   // { U123: { on, updatedAt } }
-let users = { by_user: {} }; // { U123: { token, team_id, enterprise_id, updatedAt } }
+// ---------------- KV helpers ----------------
+async function kvGet(key) {
+  if (!KV_ENABLED) return null;
+  try {
+    const res = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${KV_TOKEN}` }
+    });
+    if (!res.ok) return null;
+    const out = await res.json();
+    return out.result ?? null;
+  } catch {
+    return null;
+  }
+}
 
-const setUserMode = (uid, on) => { state.users[uid] = { on: !!on, updatedAt: Date.now() }; };
-const getUserMode = (uid) => !!(state.users?.[uid]?.on);
-const getUserToken = (uid) => users?.by_user?.[uid]?.token || null;
-const saveUserToken = (uid, token, team_id, enterprise_id) => {
-  users.by_user = users.by_user || {};
-  users.by_user[uid] = { token, team_id, enterprise_id, updatedAt: Date.now() };
+async function kvSet(key, value) {
+  if (!KV_ENABLED) return;
+  try {
+    await fetch(`${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${KV_TOKEN}` }
+    });
+  } catch {}
+}
+
+async function kvDel(key) {
+  if (!KV_ENABLED) return;
+  try {
+    await fetch(`${KV_URL}/del/${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${KV_TOKEN}` }
+    });
+  } catch {}
+}
+
+// ---------------- Persistence (KV-backed, fallback memory) ----------------
+let mem = { users: {}, by_user: {} }; // fallback only
+
+const setUserMode = async (uid, on) => {
+  if (KV_ENABLED) {
+    await kvSet(`hd:state:${uid}`, on ? '1' : '0');
+  } else {
+    mem.users[uid] = { on: !!on, updatedAt: Date.now() };
+  }
+};
+
+const getUserMode = async (uid) => {
+  if (KV_ENABLED) {
+    const v = await kvGet(`hd:state:${uid}`);
+    return v === '1';
+  }
+  return !!(mem.users?.[uid]?.on);
+};
+
+const saveUserToken = async (uid, token, team_id, enterprise_id) => {
+  if (KV_ENABLED) {
+    await kvSet(`hd:token:${uid}`, JSON.stringify({ token, team_id, enterprise_id, updatedAt: Date.now() }));
+  } else {
+    mem.by_user[uid] = { token, team_id, enterprise_id, updatedAt: Date.now() };
+  }
+};
+
+const getUserToken = async (uid) => {
+  if (KV_ENABLED) {
+    const raw = await kvGet(`hd:token:${uid}`);
+    if (!raw) return null;
+    try {
+      const obj = JSON.parse(raw);
+      return obj.token || null;
+    } catch {
+      return null;
+    }
+  }
+  return mem?.by_user?.[uid]?.token || null;
+};
+
+const deleteUserToken = async (uid) => {
+  if (KV_ENABLED) {
+    await kvDel(`hd:token:${uid}`);
+  } else {
+    delete mem.by_user[uid];
+  }
 };
 
 // ---------------- Build app depending on env ----------------
 const useSocketMode = !process.env.VERCEL && !!process.env.SLACK_APP_TOKEN;
 
-let boltApp;       // Bolt app
-let webApp;        // Express app serving OAuth/health (and all endpoints in HTTP mode)
-let receiver;      // ExpressReceiver in HTTP mode
+let boltApp;
+let webApp;
+let receiver;
 
 if (useSocketMode) {
-  // ---- Local dev: Socket Mode (no custom receiver) ----
   boltApp = new App({
     token: BOT_TOKEN,
     signingSecret: SIGNING_SECRET,
@@ -74,9 +151,8 @@ if (useSocketMode) {
     socketMode: true,
     logLevel: LogLevel.INFO,
   });
-  webApp = express(); // just for OAuth/health locally
+  webApp = express();
 } else {
-  // ---- HTTP mode (Vercel or local without xapp) ----
   receiver = new ExpressReceiver({
     signingSecret: SIGNING_SECRET,
     processBeforeResponse: true,
@@ -105,8 +181,6 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
     const uid = command.user_id || '';
     const allowed = isTeamMember(uid);
 
-    console.log('[availability]', { uid, allowed, normalizedAllowList: Array.from(TEAM_USER_ID_SET) });
-
     if (!allowed) {
       const preview = Array.from(TEAM_USER_ID_SET).slice(0, 6).join(', ') || '(empty)';
       return respond({
@@ -120,7 +194,7 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
     }
 
     const arg = (command.text || '').trim().toLowerCase();
-    const userToken = getUserToken(uid);
+    const userToken = await getUserToken(uid);
     const uWeb = userToken ? new WebClient(userToken) : null;
 
     const setStatus = async (emoji, text) => {
@@ -133,24 +207,25 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
     };
 
     if (['on','enable','start'].includes(arg)) {
-      setUserMode(uid, true);
+      await setUserMode(uid, true);
       await setStatus(STATUS_EMOJI, STATUS_TEXT);
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *ON*. I will auto-reply in DMs.' });
     }
 
     if (['off','disable','stop'].includes(arg)) {
-      setUserMode(uid, false);
+      await setUserMode(uid, false);
       await setStatus('', '');
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *OFF*. I will not auto-reply in DMs.' });
     }
 
     if (arg === 'status') {
-      return respond({ response_type: 'ephemeral', text: `Your heads-down guard is *${getUserMode(uid) ? 'ON' : 'OFF'}*.` });
+      const on = await getUserMode(uid);
+      return respond({ response_type: 'ephemeral', text: `Your heads-down guard is *${on ? 'ON' : 'OFF'}*.` });
     }
 
     // default toggle
-    const now = !getUserMode(uid);
-    setUserMode(uid, now);
+    const now = !(await getUserMode(uid));
+    await setUserMode(uid, now);
     await setStatus(now ? STATUS_EMOJI : '', now ? STATUS_TEXT : '');
     return respond({ response_type: 'ephemeral', text: `Toggled. Heads-down is now *${now ? 'ON' : 'OFF'}*.` });
   } catch (e) {
@@ -170,8 +245,8 @@ boltApp.event('message', async ({ event, logger }) => {
     const senderId = event.user;
 
     for (const recipientId of TEAM_USER_ID_SET) {
-      if (!getUserMode(recipientId)) continue;
-      const userToken = getUserToken(recipientId);
+      if (!(await getUserMode(recipientId))) continue;
+      const userToken = await getUserToken(recipientId);
       if (!userToken) continue;
 
       const uWeb = new WebClient(userToken);
@@ -187,15 +262,10 @@ boltApp.event('message', async ({ event, logger }) => {
 
       if (senderId === recipientId || event.bot_id) return;
 
-      // ---- Channel mention that ALWAYS shows "#name"
+      // Channel mention (will render as #name)
       const routeText = (() => {
-        const cleanName = (ROUTE_CHANNEL_NAME || '').replace(/^#/, '');
-        if (!cleanName) return '#general'; // ultra-safe fallback
-        if (ROUTE_CHANNEL_ID) {
-          // Keep it a real mention but force the visible text as "#name"
-          return `<#${ROUTE_CHANNEL_ID}|#${cleanName}>`;
-        }
-        // No ID? Show plain "#name" (Slack will link if it can)
+        if (ROUTE_CHANNEL_ID) return `<#${ROUTE_CHANNEL_ID}>`;
+        const cleanName = ROUTE_CHANNEL_NAME.replace(/^#/, '');
         return `#${cleanName}`;
       })();
 
@@ -246,7 +316,7 @@ webApp.get('/slack/install', (_req, res) => {
   res.redirect(`https://slack.com/oauth/v2/authorize?${params.toString()}`);
 });
 
-// ✅ OAuth redirect with state validation
+// OAuth redirect with state validation
 webApp.get('/slack/oauth_redirect', async (req, res) => {
   try {
     const { code, state } = req.query;
@@ -266,7 +336,7 @@ webApp.get('/slack/oauth_redirect', async (req, res) => {
     const authed = out.authed_user || {};
     const userId = authed.id;
     const token  = authed.access_token;
-    if (userId && token) saveUserToken(userId, token, out.team?.id, out.enterprise?.id);
+    if (userId && token) await saveUserToken(userId, token, out.team?.id, out.enterprise?.id);
 
     res.status(200).send(`<h1>Success!</h1><p>Saved user token for ${userId}. You can close this window.</p>`);
   } catch (e) {
@@ -276,22 +346,39 @@ webApp.get('/slack/oauth_redirect', async (req, res) => {
 });
 
 webApp.get('/health', (_req, res) => res.json({ ok: true }));
-webApp.get('/api/debug/team', (_req, res) => {
+
+// Debug: show allow-list + which users we have tokens for (KV-aware)
+webApp.get('/api/debug/team', async (_req, res) => {
+  let tokens = [];
+  if (!KV_ENABLED) {
+    tokens = Object.keys(mem.by_user || {});
+  } else {
+    // Cheap approximation: check known allow-list users
+    const list = Array.from(TEAM_USER_ID_SET);
+    const found = [];
+    for (const uid of list) {
+      const t = await kvGet(`hd:token:${uid}`);
+      if (t) found.push(uid);
+    }
+    tokens = found;
+  }
+
   res.json({
     team_name: TEAM_NAME,
     raw_env: RAW_TEAM_USER_IDS,
     normalized: Array.from(TEAM_USER_ID_SET),
-    has_tokens_for: Object.keys(users.by_user || {}),
-    transport: useSocketMode ? 'socket' : 'http'
+    has_tokens_for: tokens,
+    transport: useSocketMode ? 'socket' : 'http',
+    kv: KV_ENABLED ? 'on' : 'off',
   });
 });
 
-// --- Debug: show exact OAuth redirect URI the app will use
+// Debug: show exact OAuth redirect URI
 webApp.get('/slack/redirect_uri', (_req, res) => {
   res.type('text/plain').send(redirectUri());
 });
 
-// --- Debug: list all Slack endpoints to copy/paste into the Slack App config
+// Debug: list endpoints
 webApp.get('/api/debug/urls', (_req, res) => {
   const isProd  = !!process.env.VERCEL_URL;
   const proto   = isProd ? 'https' : 'http';
@@ -311,9 +398,8 @@ webApp.get('/api/debug/urls', (_req, res) => {
 // ---------------- Start ----------------
 (async () => {
   await boltApp.start();
-  console.log(`[DM-Redirect] Started. Transport=${useSocketMode ? 'SocketMode' : 'HTTP'}`);
+  console.log(`[DM-Redirect] Started. Transport=${useSocketMode ? 'SocketMode' : 'HTTP'}; KV=${KV_ENABLED ? 'on' : 'off'}`);
 
-  // Only listen locally; Vercel handles HTTP via exported handler
   if (!IS_VERCEL) {
     webApp.listen(PORT, () => {
       console.log(`HTTP listening on http://localhost:${PORT}`);
@@ -325,5 +411,4 @@ webApp.get('/api/debug/urls', (_req, res) => {
   }
 })();
 
-// Export Express app so Vercel can handle HTTP routes
 module.exports = webApp;
