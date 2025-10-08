@@ -59,8 +59,6 @@ const saveUserToken = (uid, token, team_id, enterprise_id) => {
 };
 
 // ---------------- Build app depending on env ----------------
-// Socket Mode locally ONLY IF we actually have an app token;
-// otherwise use HTTP (works both locally with a tunnel and on Vercel).
 const useSocketMode = !process.env.VERCEL && !!process.env.SLACK_APP_TOKEN;
 
 let boltApp;       // Bolt app
@@ -72,11 +70,11 @@ if (useSocketMode) {
   boltApp = new App({
     token: BOT_TOKEN,
     signingSecret: SIGNING_SECRET,
-    appToken: APP_TOKEN,       // ensured by useSocketMode guard
+    appToken: APP_TOKEN,
     socketMode: true,
     logLevel: LogLevel.INFO,
   });
-  webApp = express();          // just for OAuth/health locally
+  webApp = express(); // just for OAuth/health locally
 } else {
   // ---- HTTP mode (Vercel or local without xapp) ----
   receiver = new ExpressReceiver({
@@ -101,7 +99,7 @@ const botWeb = new WebClient(BOT_TOKEN);
 
 // ---------------- Slash command: /availability ----------------
 boltApp.command('/availability', async ({ command, ack, respond }) => {
-  await ack(); // prevents Slack "dispatch_failed"
+  await ack();
 
   try {
     const uid = command.user_id || '';
@@ -134,13 +132,13 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
       }
     };
 
-    if (['on', 'enable', 'start'].includes(arg)) {
+    if (['on','enable','start'].includes(arg)) {
       setUserMode(uid, true);
       await setStatus(STATUS_EMOJI, STATUS_TEXT);
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *ON*. I will auto-reply in DMs.' });
     }
 
-    if (['off', 'disable', 'stop'].includes(arg)) {
+    if (['off','disable','stop'].includes(arg)) {
       setUserMode(uid, false);
       await setStatus('', '');
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *OFF*. I will not auto-reply in DMs.' });
@@ -189,10 +187,15 @@ boltApp.event('message', async ({ event, logger }) => {
 
       if (senderId === recipientId || event.bot_id) return;
 
-      // Build a true channel mention (Slack renders with the real #name)
+      // ---- Channel mention that ALWAYS shows "#name"
       const routeText = (() => {
-        if (ROUTE_CHANNEL_ID) return `<#${ROUTE_CHANNEL_ID}>`;
-        const cleanName = ROUTE_CHANNEL_NAME.replace(/^#/, '');
+        const cleanName = (ROUTE_CHANNEL_NAME || '').replace(/^#/, '');
+        if (!cleanName) return '#general'; // ultra-safe fallback
+        if (ROUTE_CHANNEL_ID) {
+          // Keep it a real mention but force the visible text as "#name"
+          return `<#${ROUTE_CHANNEL_ID}|#${cleanName}>`;
+        }
+        // No ID? Show plain "#name" (Slack will link if it can)
         return `#${cleanName}`;
       })();
 
@@ -206,7 +209,6 @@ boltApp.event('message', async ({ event, logger }) => {
         text,
         thread_ts: event.ts,
         mrkdwn: true,
-        // force Slack to resolve mentions/links
         parse: 'full',
         link_names: true,
         unfurl_links: false,
