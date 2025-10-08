@@ -1,10 +1,14 @@
-// app.js — TPRM DM Redirect Bot (Socket locally if xapp is present; HTTP on Vercel)
+\// app.js — TPRM DM Redirect Bot (Socket locally if xapp is present; HTTP on Vercel)
 require('dotenv').config();
 
 const { App, LogLevel, ExpressReceiver } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
 const express = require('express');
-const fetch = require('node-fetch'); // present on Vercel; works locally too
+
+// Use native fetch on Node 18+; fall back to node-fetch only if needed
+const fetch =
+  globalThis.fetch ||
+  ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
 // ---------------- Env ----------------
 const BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
