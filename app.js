@@ -4,9 +4,7 @@ require('dotenv').config();
 const { App, LogLevel, ExpressReceiver } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
 const express = require('express');
-
-// Node 18+/Vercel: fetch is native
-const fetch = globalThis.fetch;
+// Using global fetch (Node 18+/Vercel). No node-fetch import required.
 
 // ---------------- Env ----------------
 const BOT_TOKEN      = process.env.SLACK_BOT_TOKEN;
@@ -53,6 +51,19 @@ const isTeamMember = (uid) => TEAM_USER_ID_SET.has(norm(uid));
 if (TEAM_USER_ID_SET.size === 0) {
   console.warn('[DM-Redirect] TEAM_USER_IDS normalized to EMPTY. RAW:', RAW_TEAM_USER_IDS);
 }
+
+// ---------------- Emoji sanitizer (new) ----------------
+function sanitizeEmoji(raw) {
+  if (!raw) return ':no_bell:'; // default
+  const s0 = String(raw).trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, ''); // strip quotes
+  // allow a single Unicode emoji (e.g., 🔕)
+  const isUnicodeEmoji = /\p{Extended_Pictographic}/u.test(s0);
+  if (isUnicodeEmoji) return s0;
+  // ensure :shortname: form
+  const short = s0.replace(/:/g, '');
+  return `:${short}:`;
+}
+const STATUS_EMOJI_SAFE = sanitizeEmoji(STATUS_EMOJI);
 
 // ---------------- KV helpers ----------------
 async function kvGet(key) {
@@ -202,7 +213,9 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
     const setStatus = async (emoji, text) => {
       if (!uWeb) return;
       try {
-        await uWeb.users.profile.set({ profile: { status_emoji: emoji, status_text: text, status_expiration: 0 } });
+        await uWeb.users.profile.set({
+          profile: { status_emoji: emoji, status_text: text, status_expiration: 0 }
+        });
       } catch (e) {
         console.error('users.profile.set failed:', e?.data || e?.message || e);
       }
@@ -210,7 +223,7 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
 
     if (['on','enable','start'].includes(arg)) {
       await setUserMode(uid, true);
-      await setStatus(STATUS_EMOJI, STATUS_TEXT);
+      await setStatus(STATUS_EMOJI_SAFE, STATUS_TEXT);
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *ON*. I will auto-reply in DMs.' });
     }
 
@@ -228,7 +241,7 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
     // default toggle
     const now = !(await getUserMode(uid));
     await setUserMode(uid, now);
-    await setStatus(now ? STATUS_EMOJI : '', now ? STATUS_TEXT : '');
+    await setStatus(now ? STATUS_EMOJI_SAFE : '', now ? STATUS_TEXT : '');
     return respond({ response_type: 'ephemeral', text: `Toggled. Heads-down is now *${now ? 'ON' : 'OFF'}*.` });
   } catch (e) {
     console.error('/availability error:', e);
@@ -264,7 +277,7 @@ boltApp.event('message', async ({ event, logger }) => {
 
       if (senderId === recipientId || event.bot_id) return;
 
-      // Channel mention (renders as #name)
+      // Channel mention (will render as #name when Slack resolves it)
       const routeText = (() => {
         if (ROUTE_CHANNEL_ID) return `<#${ROUTE_CHANNEL_ID}>`;
         const cleanName = ROUTE_CHANNEL_NAME.replace(/^#/, '');
@@ -349,11 +362,13 @@ webApp.get('/slack/oauth_redirect', async (req, res) => {
 
 webApp.get('/health', (_req, res) => res.json({ ok: true }));
 
+// Debug: show allow-list + which users we have tokens for (KV-aware)
 webApp.get('/api/debug/team', async (_req, res) => {
   let tokens = [];
   if (!KV_ENABLED) {
     tokens = Object.keys(mem.by_user || {});
   } else {
+    // Cheap approximation: check known allow-list users
     const list = Array.from(TEAM_USER_ID_SET);
     const found = [];
     for (const uid of list) {
@@ -373,10 +388,12 @@ webApp.get('/api/debug/team', async (_req, res) => {
   });
 });
 
+// Debug: show exact OAuth redirect URI
 webApp.get('/slack/redirect_uri', (_req, res) => {
   res.type('text/plain').send(redirectUri());
 });
 
+// Debug: list endpoints
 webApp.get('/api/debug/urls', (_req, res) => {
   const isProd  = !!process.env.VERCEL_URL;
   const proto   = isProd ? 'https' : 'http';
@@ -395,14 +412,8 @@ webApp.get('/api/debug/urls', (_req, res) => {
 
 // ---------------- Start ----------------
 (async () => {
-  // Only start Bolt when using Socket Mode (local). In HTTP/ExpressReceiver mode (Vercel),
-  // exporting the Express app is enough — do NOT start a server in a serverless function.
-  if (useSocketMode) {
-    await boltApp.start();
-    console.log(`[DM-Redirect] Started (SocketMode). KV=${KV_ENABLED ? 'on' : 'off'}`);
-  } else {
-    console.log(`[DM-Redirect] ExpressReceiver mode (Vercel/HTTP). KV=${KV_ENABLED ? 'on' : 'off'}`);
-  }
+  await boltApp.start();
+  console.log(`[DM-Redirect] Started. Transport=${useSocketMode ? 'SocketMode' : 'HTTP'}; KV=${KV_ENABLED ? 'on' : 'off'}`);
 
   if (!IS_VERCEL) {
     webApp.listen(PORT, () => {
