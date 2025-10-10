@@ -17,9 +17,9 @@ const STATE_SECRET   = process.env.SLACK_STATE_SECRET || 'state-not-set';
 
 const TEAM_NAME          = process.env.TEAM_NAME || 'Team';
 const ROUTE_CHANNEL_ID   = process.env.ROUTE_CHANNEL_ID || '';
-const ROUTE_CHANNEL_NAME = process.env.ROUTE_CHANNEL_NAME || '#team-channel';
-const STATUS_EMOJI       = process.env.STATUS_EMOJI || ':no_bell:';
-const STATUS_TEXT        = process.env.STATUS_TEXT  || `Heads-down — please post in ${ROUTE_CHANNEL_NAME}`;
+const ROUTE_CHANNEL_NAME = process.env.ROUTE_CHANNEL_NAME || '#tprm_questions'; // default to your channel
+const STATUS_EMOJI       = process.env.STATUS_EMOJI || ':no_bell:';             // 🔕 by default
+const STATUS_TEXT_ENV    = process.env.STATUS_TEXT || ''; // if empty, we build it automatically
 
 const PORT      = Number(process.env.OAUTH_PORT || 3000);
 const IS_VERCEL = !!process.env.VERCEL;
@@ -52,7 +52,7 @@ if (TEAM_USER_ID_SET.size === 0) {
   console.warn('[DM-Redirect] TEAM_USER_IDS normalized to EMPTY. RAW:', RAW_TEAM_USER_IDS);
 }
 
-// ---------------- Emoji sanitizer ----------------
+// ---------------- Emoji + status text helpers ----------------
 function sanitizeEmoji(raw) {
   if (!raw) return ':no_bell:'; // default
   const s0 = String(raw).trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');
@@ -62,6 +62,19 @@ function sanitizeEmoji(raw) {
   return `:${short}:`;
 }
 const STATUS_EMOJI_SAFE = sanitizeEmoji(STATUS_EMOJI);
+
+function channelDisplay() {
+  // For status text, Slack won’t link it anyway—use a clean #name.
+  const clean = ROUTE_CHANNEL_NAME.startsWith('#') ? ROUTE_CHANNEL_NAME : `#${ROUTE_CHANNEL_NAME}`;
+  return clean;
+}
+
+function statusText() {
+  // If STATUS_TEXT provided in env, prefer that exactly.
+  // Else build the requested sentence with channel name.
+  if (STATUS_TEXT_ENV && STATUS_TEXT_ENV.trim()) return STATUS_TEXT_ENV.trim();
+  return `I'm currently heads-down in work, please reach out to ${channelDisplay()}.`;
+}
 
 // ---------------- KV helpers ----------------
 async function kvGet(key) {
@@ -185,6 +198,13 @@ if (useSocketMode) {
 const botWeb = new WebClient(BOT_TOKEN);
 
 // Helper to build Install URL for re-auth prompts
+function redirectUri() {
+  const isProd = !!process.env.VERCEL_URL;
+  const proto = isProd ? 'https' : 'http';
+  const host  = HOST.replace(/^https?:\/\//, '');
+  const portSeg = (!isProd && PORT) ? `:${PORT}` : '';
+  return `${proto}://${host}${portSeg}/slack/oauth_redirect`;
+}
 function installUrl() {
   const params = new URLSearchParams({
     client_id: CLIENT_ID || '',
@@ -203,8 +223,6 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
   try {
     const uid = command.user_id || '';
     const allowed = isTeamMember(uid);
-
-    console.log('[availability] from', uid, 'allowed=', allowed);
 
     if (!allowed) {
       const preview = Array.from(TEAM_USER_ID_SET).slice(0, 6).join(', ') || '(empty)';
@@ -234,22 +252,21 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
       }
     };
 
-    // If they try to turn ON (or toggle) but we have no token, guide them to reinstall
     const needsTokenHelp = (!hasToken && (['on','enable','start',''].includes(arg)));
 
     if (needsTokenHelp) {
       return respond({
         response_type: 'ephemeral',
         text:
-          `I can’t change your status yet because I don’t have your user permission.\n` +
+          `I can’t set your status yet because I don’t have your user permission.\n` +
           `Please click *Install* and press *Allow*: ${installUrl()}\n` +
-          `_After that, run \`/availability on\` again._`,
+          `_Then run \`/availability on\` again._`,
       });
     }
 
     if (['on','enable','start'].includes(arg)) {
       await setUserMode(uid, true);
-      if (hasToken) await setStatus(STATUS_EMOJI_SAFE, STATUS_TEXT);
+      if (hasToken) await setStatus(STATUS_EMOJI_SAFE, statusText());
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *ON*. I will auto-reply in DMs.' });
     }
 
@@ -272,7 +289,7 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
     // default toggle
     const now = !(await getUserMode(uid));
     await setUserMode(uid, now);
-    if (hasToken) await setStatus(now ? STATUS_EMOJI_SAFE : '', now ? STATUS_TEXT : '');
+    if (hasToken) await setStatus(now ? STATUS_EMOJI_SAFE : '', now ? statusText() : '');
     return respond({ response_type: 'ephemeral', text: `Toggled. Heads-down is now *${now ? 'ON' : 'OFF'}*.` });
   } catch (e) {
     console.error('/availability error:', e);
@@ -314,8 +331,8 @@ boltApp.event('message', async ({ event, logger }) => {
       // Channel mention (renders as #name)
       const routeText = (() => {
         if (ROUTE_CHANNEL_ID) return `<#${ROUTE_CHANNEL_ID}>`;
-        const cleanName = ROUTE_CHANNEL_NAME.replace(/^#/, '');
-        return `#${cleanName}`;
+        const cleanName = ROUTE_CHANNEL_NAME.startsWith('#') ? ROUTE_CHANNEL_NAME : `#${ROUTE_CHANNEL_NAME}`;
+        return cleanName;
       })();
 
       const text =
@@ -341,13 +358,7 @@ boltApp.event('message', async ({ event, logger }) => {
 });
 
 // ---------------- OAuth + health/debug ----------------
-function redirectUri() {
-  const isProd = !!process.env.VERCEL_URL;
-  const proto = isProd ? 'https' : 'http';
-  const host  = HOST.replace(/^https?:\/\//, '');
-  const portSeg = (!isProd && PORT) ? `:${PORT}` : '';
-  return `${proto}://${host}${portSeg}/slack/oauth_redirect`;
-}
+webApp = webApp || express();
 
 webApp.get('/', (_req, res) => {
   res.send('TPRM DM Redirect Bot is running. Visit /slack/install to authorize a user.');
@@ -358,7 +369,6 @@ webApp.get('/slack/install', (_req, res) => {
   res.redirect(installUrl());
 });
 
-// OAuth redirect with state validation
 webApp.get('/slack/oauth_redirect', async (req, res) => {
   try {
     const { code, state } = req.query;
@@ -389,13 +399,11 @@ webApp.get('/slack/oauth_redirect', async (req, res) => {
 
 webApp.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Debug: show allow-list + which users we have tokens for (KV-aware)
 webApp.get('/api/debug/team', async (_req, res) => {
   let tokens = [];
   if (!KV_ENABLED) {
     tokens = Object.keys(mem.by_user || {});
   } else {
-    // Cheap check across allow-list
     const list = Array.from(TEAM_USER_ID_SET);
     const found = [];
     for (const uid of list) {
@@ -415,12 +423,10 @@ webApp.get('/api/debug/team', async (_req, res) => {
   });
 });
 
-// Debug: show exact OAuth redirect URI
 webApp.get('/slack/redirect_uri', (_req, res) => {
   res.type('text/plain').send(redirectUri());
 });
 
-// Debug: list endpoints
 webApp.get('/api/debug/urls', (_req, res) => {
   const isProd  = !!process.env.VERCEL_URL;
   const proto   = isProd ? 'https' : 'http';
@@ -442,7 +448,6 @@ webApp.get('/api/debug/urls', (_req, res) => {
   await boltApp.start();
   console.log(`[DM-Redirect] Started. Transport=${useSocketMode ? 'SocketMode' : 'HTTP'}; KV=${KV_ENABLED ? 'on' : 'off'}`);
 
-  // Only listen locally; Vercel handles HTTP via exported handler
   if (!IS_VERCEL) {
     webApp.listen(PORT, () => {
       console.log(`HTTP listening on http://localhost:${PORT}`);
