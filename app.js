@@ -184,6 +184,18 @@ if (useSocketMode) {
 
 const botWeb = new WebClient(BOT_TOKEN);
 
+// Helper to build Install URL for re-auth prompts
+function installUrl() {
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID || '',
+    scope: 'commands',
+    user_scope: 'im:history,chat:write,users.profile:write',
+    redirect_uri: redirectUri(),
+    state: STATE_SECRET,
+  });
+  return `https://slack.com/oauth/v2/authorize?${params.toString()}`;
+}
+
 // ---------------- Slash command: /availability ----------------
 boltApp.command('/availability', async ({ command, ack, respond }) => {
   await ack();
@@ -191,6 +203,8 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
   try {
     const uid = command.user_id || '';
     const allowed = isTeamMember(uid);
+
+    console.log('[availability] from', uid, 'allowed=', allowed);
 
     if (!allowed) {
       const preview = Array.from(TEAM_USER_ID_SET).slice(0, 6).join(', ') || '(empty)';
@@ -206,7 +220,8 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
 
     const arg = (command.text || '').trim().toLowerCase();
     const userToken = await getUserToken(uid);
-    const uWeb = userToken ? new WebClient(userToken) : null;
+    const hasToken  = !!userToken;
+    const uWeb = hasToken ? new WebClient(userToken) : null;
 
     const setStatus = async (emoji, text) => {
       if (!uWeb) return;
@@ -219,27 +234,45 @@ boltApp.command('/availability', async ({ command, ack, respond }) => {
       }
     };
 
+    // If they try to turn ON (or toggle) but we have no token, guide them to reinstall
+    const needsTokenHelp = (!hasToken && (['on','enable','start',''].includes(arg)));
+
+    if (needsTokenHelp) {
+      return respond({
+        response_type: 'ephemeral',
+        text:
+          `I can’t change your status yet because I don’t have your user permission.\n` +
+          `Please click *Install* and press *Allow*: ${installUrl()}\n` +
+          `_After that, run \`/availability on\` again._`,
+      });
+    }
+
     if (['on','enable','start'].includes(arg)) {
       await setUserMode(uid, true);
-      await setStatus(STATUS_EMOJI_SAFE, STATUS_TEXT);
+      if (hasToken) await setStatus(STATUS_EMOJI_SAFE, STATUS_TEXT);
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *ON*. I will auto-reply in DMs.' });
     }
 
     if (['off','disable','stop'].includes(arg)) {
       await setUserMode(uid, false);
-      await setStatus('', '');
+      if (hasToken) await setStatus('', '');
       return respond({ response_type: 'ephemeral', text: 'Heads-down is *OFF*. I will not auto-reply in DMs.' });
     }
 
     if (arg === 'status') {
       const on = await getUserMode(uid);
-      return respond({ response_type: 'ephemeral', text: `Your heads-down guard is *${on ? 'ON' : 'OFF'}*.` });
+      return respond({
+        response_type: 'ephemeral',
+        text:
+          `Heads-down is *${on ? 'ON' : 'OFF'}*.\n` +
+          `Token: *${hasToken ? 'present' : 'missing'}*${hasToken ? '' : `\nInstall to fix: ${installUrl()}`}`,
+      });
     }
 
     // default toggle
     const now = !(await getUserMode(uid));
     await setUserMode(uid, now);
-    await setStatus(now ? STATUS_EMOJI_SAFE : '', now ? STATUS_TEXT : '');
+    if (hasToken) await setStatus(now ? STATUS_EMOJI_SAFE : '', now ? STATUS_TEXT : '');
     return respond({ response_type: 'ephemeral', text: `Toggled. Heads-down is now *${now ? 'ON' : 'OFF'}*.` });
   } catch (e) {
     console.error('/availability error:', e);
@@ -260,7 +293,10 @@ boltApp.event('message', async ({ event, logger }) => {
     for (const recipientId of TEAM_USER_ID_SET) {
       if (!(await getUserMode(recipientId))) continue;
       const userToken = await getUserToken(recipientId);
-      if (!userToken) continue;
+      if (!userToken) {
+        logger?.info?.(`[dm] skip: no user token for ${recipientId}`);
+        continue;
+      }
 
       const uWeb = new WebClient(userToken);
 
@@ -275,7 +311,7 @@ boltApp.event('message', async ({ event, logger }) => {
 
       if (senderId === recipientId || event.bot_id) return;
 
-      // Channel mention (will render as #name when Slack resolves it)
+      // Channel mention (renders as #name)
       const routeText = (() => {
         if (ROUTE_CHANNEL_ID) return `<#${ROUTE_CHANNEL_ID}>`;
         const cleanName = ROUTE_CHANNEL_NAME.replace(/^#/, '');
@@ -319,14 +355,7 @@ webApp.get('/', (_req, res) => {
 
 webApp.get('/slack/install', (_req, res) => {
   if (!CLIENT_ID) return res.status(500).send('Missing SLACK_CLIENT_ID');
-  const params = new URLSearchParams({
-    client_id: CLIENT_ID,
-    scope: 'commands',
-    user_scope: 'im:history,chat:write,users.profile:write',
-    redirect_uri: redirectUri(),
-    state: STATE_SECRET,
-  });
-  res.redirect(`https://slack.com/oauth/v2/authorize?${params.toString()}`);
+  res.redirect(installUrl());
 });
 
 // OAuth redirect with state validation
@@ -366,7 +395,7 @@ webApp.get('/api/debug/team', async (_req, res) => {
   if (!KV_ENABLED) {
     tokens = Object.keys(mem.by_user || {});
   } else {
-    // Cheap approximation: check known allow-list users
+    // Cheap check across allow-list
     const list = Array.from(TEAM_USER_ID_SET);
     const found = [];
     for (const uid of list) {
