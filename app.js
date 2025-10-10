@@ -52,14 +52,12 @@ if (TEAM_USER_ID_SET.size === 0) {
   console.warn('[DM-Redirect] TEAM_USER_IDS normalized to EMPTY. RAW:', RAW_TEAM_USER_IDS);
 }
 
-// ---------------- Emoji sanitizer (new) ----------------
+// ---------------- Emoji sanitizer ----------------
 function sanitizeEmoji(raw) {
   if (!raw) return ':no_bell:'; // default
-  const s0 = String(raw).trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, ''); // strip quotes
-  // allow a single Unicode emoji (e.g., 🔕)
+  const s0 = String(raw).trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');
   const isUnicodeEmoji = /\p{Extended_Pictographic}/u.test(s0);
   if (isUnicodeEmoji) return s0;
-  // ensure :shortname: form
   const short = s0.replace(/:/g, '');
   return `:${short}:`;
 }
@@ -415,6 +413,7 @@ webApp.get('/api/debug/urls', (_req, res) => {
   await boltApp.start();
   console.log(`[DM-Redirect] Started. Transport=${useSocketMode ? 'SocketMode' : 'HTTP'}; KV=${KV_ENABLED ? 'on' : 'off'}`);
 
+  // Only listen locally; Vercel handles HTTP via exported handler
   if (!IS_VERCEL) {
     webApp.listen(PORT, () => {
       console.log(`HTTP listening on http://localhost:${PORT}`);
